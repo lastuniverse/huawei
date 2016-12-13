@@ -1,0 +1,28 @@
+SEND: AT;			# инициализация
+RECIVE: []
+RECIVE: [^CEND:1,0,29,16]
+RECIVE: []
+RECIVE: [OK]			# инициализирован успешно
+SEND: ATD+79114531517;		# дозвон на номер
+RECIVE: []	
+RECIVE: [ERROR]			# ХЗ
+RECIVE: []
+RECIVE: [OK]			# Дозвон начат
+SEND: AT^DDSETEX=2		# включение голоса
+RECIVE: []
+RECIVE: [^ORIG:1,0]		# ХЗ
+RECIVE: []
+RECIVE: [OK]			# голос включен
+RECIVE: []
+RECIVE: [^CONF:1]		# дозвонились
+RECIVE: []
+RECIVE: [^CONN:1,0]		# поднял трубку
+RECIVE: []
+RECIVE: [^CEND:1,6,104,16]	# положил трубку
+RECIVE: []
+RECIVE: [RING]			# Абонент звонит нам
+RECIVE: []
+RECIVE: [RING]			# Абонент звонит нам
+RECIVE: []
+RECIVE: [^CEND:1,0,104,16]	# Абонент устал и положил трубку
+

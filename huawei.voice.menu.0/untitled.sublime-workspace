@@ -1,0 +1,366 @@
+{
+	"auto_complete":
+	{
+		"selected_items":
+		[
+		]
+	},
+	"buffers":
+	[
+		{
+			"file": "dtmf_decoder.pm",
+			"settings":
+			{
+				"buffer_size": 7849,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"contents": "#!/usr/bin/perl\n\nuse v5.16;              # использовать версию Perl не ниже указанной\nuse strict;             # включить дополнительные проверки\nuse warnings;           # и расширенную диагностику\nuse diagnostics;        # выводить подробную диагностику ошибок\nuse utf8;\nuse locale;\nno warnings 'utf8';\n\n# подключаем модуль Time::HiRes и импортируем\n# в текущее пространство имен функцию sleep\n# особенность данной функции - возможность указывать\n# задержку меньше секунды\nuse Time::HiRes qw(sleep usleep gettimeofday);\n\n# подключаем модуль dtmf_decoder\nuse dtmf_decoder;\n\n\n# Для информации:\n# Сообщения типа CEND выдаются модемом при завершении вызова\n# и содержат в себе информацию о вызове, о причине завершения вызова\n# и о состоянии устройства.\n# формат вывода ^CEND:call_index, duration, end_status, cc_cause\n# где:\n# call_index - уникальный идентификатор вызова\n# duration - длительность вызова в секундах\n# end_status - код статуса устройства после завершения вызова\n# cc_cause - код причины завершения вызова\n\n# при подключении модема к компьютеру с OS Linux\n# создаются 3 usb интерфейса для обмена данными с модемом\n# обычно это:\n# /dev/ttyUSB0 - командный интерфейс модема\n# /dev/ttyUSB1 - голосовой(при включенном голосовом режиме) интерфейс модема\n# /dev/ttyUSB2 - командный интерфейс модема. Отличается от /dev/ttyUSB0 тем\n# что с него можно читать не только ответы модема на команды, а также служебные\n# сообщения. Такие как данные о качестве сигнала, вывод ^CEND и прочее\n\n# указываем порт для отсылки модему звука\nmy $VOICE_PORT = \"/dev/ttyUSB4\";\n\n# указываем порт для подачи модему команд\nmy $COMMAND_PORT = \"/dev/ttyUSB5\";\n\n# устанавливаем в:\n# 0 - чтобы отключить вывод отладочной информации\n# 1 - чтобы включить вывод отладочной информации\nmy $VERBOSE = 0;\n\n# Открываем командный порт модема на чтение и запись\nopen my $SENDPORT, '+<', $COMMAND_PORT or die \"Can't open '$COMMAND_PORT': $!\\n\";\n\n# Открываем голосовой  порт модема на чтение и запись\n# чтение аудио потока из порта в данной программе не используется\n# но вам ничто не мешает превратить данный скрипт в автоответчик например\nopen my $SENDPORT_WAV, '+<', $VOICE_PORT or die \"Can't open '$VOICE_PORT': $!\\n\";\n\n\n# вызываем функцию ожидания вызовов, которой передаются 1 параметр:\n#  - имя файла с голосовым меню\nexpect_calls('menu.01.pl');\n\n# по окончании обзвона закрываем все открытые файлы/порты\nexit_call();\n\n\n\n# данная функция производит обзвон абонентов по списку\nsub expect_calls{\n    # получаем имя файла с голосовым меню\n    my $l_file = shift;\n\n    # загружаем голосовое меню (файл menu.01.pl)\n    my $menu = load_menu('menu.01.pl'); \n\n    # данная команда включает в модеме голосовой режим\n    # один раз включив его можно удалить/заремарить\n    # эту команду. Модем запомнит состояние.\n    #at_send('AT^CVOICE=0'); \n\n    # данная команда включает в модеме отображение номера звонящего\n    my $l_rec = at_send(\"AT+CLIP=1\",qr/^(OK|ERROR)/);\n\n\n    # цикл ожидания входящего звонка\n    while ( ) {\n        # при входящем звонке должно поступить сообщение RING\n        $l_rec = at_rec(qr/^(RING)/);\n        accept_call($menu);\n    }\n}\n\n\n# данная функция производит попытку вызова указного номера\n# и в случае успеха - транслирует голосовое сообщение\nsub accept_call{\n    my $menu = shift;\n\n    # в этом массиве хранится стtк перемещений по меню\n    my $position = [$menu];\n\n    # текущее меню\n    my $cmenu = $position->[0];\n\n    my %call_info = ();\n    # запоминаем время начала\n    $call_info{start_time} = time;\n    # ждем сообщения с номером телефона звонящего абонента #+CLIP: \"+79117654321\",145,,,,0\n    $call_info{phone} = at_rec(qr/^\\+CLIP\\: \\\"(\\+\\d+)/);\n    $call_info{phone} =~s/^\\+\\d//;\n    # генерим имя файла для записи\n    $call_info{record_fname} = \"phone_$call_info{phone}.time_$call_info{start_time}\";\n\n    # принимаем входящий вызов\n    my $l_rec = at_send(\"ATA\",qr/^(OK|ERROR)/);\n    return 0 if $l_rec eq \"ERROR\";\n\n    # ожидаем установления соединения\n    $l_rec = at_rec(qr/^\\^??(CONN\\:1|CEND\\:|ERROR)/);\n    return 0 if $l_rec ne \"CONN:1\";\n\n    # переключаем модем в режим приема/передачи голоса\n    # OK - переключение прошло успешно\n    # ERROR - переключение не произведено\n    # CEND:.... - абонент недоступен, занят или сбросил вызов\n    $l_rec = at_send('AT^DDSETEX=2',qr/(OK|ERROR|CEND\\:)/);\n    return 0 if $l_rec ne \"OK\";\n\n    # Если дошли до сюда - значит вызов установлен\n    # Звук модему и от него передается порциями по 320 байт каждые 0.02 секунды\n    print \"time: [$call_info{start_time}] \\tphone: [$call_info{phone}] \\t\".\"Вызов принят.\\n\";\n\n    my $checker = 0;\n\n    my $dtmf = 0;\n\n    # буфер для входящих аудиоданных данных\n    my $snd_in;\n    \n    # буфер для исходящих аудиоданных данных\n    my $snd_out = $cmenu->{info_voice};\n    my $snd_count = 0;\n    my $snd_max = scalar @{$snd_out};\n\n    # открываем файл для записи входящего аудиопотока\n    my $l_fh = new IO::File \"> ./messages/$call_info{record_fname}.raw\" or die \"Cannot open $call_info{record_fname}.raw : $!\";\n    binmode($l_fh);\n\n    # Устанавливаем служебную переменную $| в единицу это отключает буферизацию.\n    # Таким образом данные в звуковой порт будут отправляться незамедлительно.\n    $|=1;\n\n    # проигрываем приветстви\n    #play_voice($snd_out);\n\n    # запоминаем время для отсчета 0.02 секунд\n    my $before = gettimeofday;\n\n    # основной цикл голосового меню\n    while (){\n        if ($snd_count == $snd_max) {\n            if ($cmenu->{record}==1){\n                    $snd_out = $menu->{standart_messages}{null}{title_voice};\n                    $snd_max = scalar @{$snd_out};\n                    $cmenu->{record}=2;\n                    print \"time: [$call_info{start_time}] \\tphone: [$call_info{phone}] \\tПроизводится запись голосового сообщения в [./messages/$call_info{record_fname}.raw].\\n\";\n            }\n\n            $snd_count = 0;\n        }\n\n        syswrite  $SENDPORT_WAV, $snd_out->[$snd_count] , 320;\n\n        sysread $SENDPORT_WAV, $snd_in, 320;\n        syswrite  $l_fh, $snd_in, 320 if $cmenu->{record} && $cmenu->{record} == 2;\n\n        $dtmf = dtmf_sample($snd_in);\n\n        if ($dtmf) {\n            #print \"time: [$call_info{start_time}] \\tphone: [$call_info{phoe}] \\tНажата кнопка [$dtmf].\\n\";\n            if ($dtmf eq '#') {\n                print \"time: [$call_info{start_time}] \\tphone: [$call_info{phone}] \\tВыбран возврат в главное меню.\\n\";\n                $position = [$menu];\n                $cmenu = $position->[0];\n                $snd_out = $menu->{info_voice};\n                $snd_count = 0;\n                $snd_max = scalar @{$snd_out};\n            } elsif ($dtmf eq '*') {\n                if ((scalar @{$position}) > 1) {\n                    print \"time: [$call_info{start_time}] \\tphone: [$call_info{phone}] \\tВыбран возврат в предыдущее меню.\\n\";\n                    shift @{$position};\n                    $cmenu = $position->[0];\n                    $snd_out = $cmenu->{info_voice};\n                    $snd_count = 0;\n                    $snd_max = scalar @{$snd_out};\n                }\n            } elsif ($cmenu->{menu}) {\n                if ($cmenu->{menu}{$dtmf}) {\n                    $cmenu = $cmenu->{menu}{$dtmf};\n                    print \"time: [$call_info{start_time}] \\tphone: [$call_info{phone}] \\tВыбран пункт меню [$cmenu->{title}].\\n\";\n                    unshift @{$position}, $cmenu;\n                    $snd_out = $cmenu->{info_voice};\n                    $snd_count = 0;\n                    $snd_max = scalar @{$snd_out};\n                    if ($cmenu->{command}) {\n                        print \"time: [$call_info{start_time}] \\tphone: [$call_info{phone}] \\tВыполнена команда [$cmenu->{command}].\\n\";\n                        system \"$cmenu->{command} &\";\n                    }\n                } \n            }\n        }\n\n        # мониторим состояние звонка\n        if ($checker==10) {\n            $l_rec = at_send(\"AT+CLCC\",qr/^\\^??(OK|ERROR|CEND)/);\n            # выходим если сброшен\n            if ($l_rec eq \"CEND\") {\n                print \"time: [$call_info{start_time}] \\tphone: [$call_info{phone}] \\tВызов завершен.\\n\";\n                return 0\n            }\n            $checker=0;\n        }\n\n        # ряд управляющих циклом переменных\n        $dtmf=0;\n        $checker++;\n        $snd_count++;\n\n        # ожидаем остаток времени\n        while( gettimeofday-$before < 0.02 ) { }\n        $before = gettimeofday;\n    }\n\n    # Вешаем трубку.\n    at_send('AT+CHUP');\n\n    # закрываем файл с полученным сообщением\n    close $l_fh;\n}\n\nsub play_voice{\n    my $voice = shift;\n    my $count = shift || 1;\n    while ($count) {\n        for my $sampe (@{$voice}){\n            syswrite  $SENDPORT_WAV, $sampe, 320;\n            #sleep(0.02);\n            my $before = gettimeofday;\n            while( gettimeofday-$before < 0.02 ) { }\n        }\n        $count--;\n    }\n}\n\n# данная функция загружает голосовое меню\nsub load_menu{\n    my $l_file_name = shift;\n    my %voice_menu = do $l_file_name;\n    $voice_menu{standart_messages}{null}{title_voice} = load_voice($voice_menu{standart_messages}{null}{title_voice_fname});\n    $voice_menu{standart_messages}{back}{title_voice} = load_voice($voice_menu{standart_messages}{back}{title_voice_fname});\n    $voice_menu{standart_messages}{back_to_main}{title_voice} = load_voice($voice_menu{title_voice_fname});\n    load_menu_voices(\\%voice_menu,$voice_menu{standart_messages});\n    return \\%voice_menu;\n}\n\n# данная функция загружает аудиофайлы голосового меню\nsub load_menu_voices{\n    my $menu = shift;\n    my $standart_messages = shift;\n    $menu->{info_voice} = load_voice($menu->{info_voice_fname});\n    for my $key (sort {$a <=> $b} keys %{$menu->{menu}}){\n        my $cur = $menu->{menu}{$key};\n        my $sub_voice = load_menu_voices($cur,$standart_messages);\n        $menu->{info_voice} = [@{$menu->{info_voice}},@{$sub_voice}];\n    }\n    $menu->{info_voice} = [ @{$menu->{info_voice}},\n                            @{$standart_messages->{back}{title_voice}},\n                            @{$standart_messages->{back_to_main}{title_voice}},\n                            @{$standart_messages->{null}{title_voice}},\n                            @{$standart_messages->{null}{title_voice}}\n                          ];\n    return load_voice($menu->{title_voice_fname});\n}\n\n# данная функция загружает голосовое сообщение в массив кусками по 320 байт\n# принимает 1 параметр - имя файла\n# формат звуковых данных - pcm, моно, 8000 кГц, 16 бит, signed\nsub load_voice{\n    my $l_file_name = shift;\n    print \"FILENAME: [$l_file_name]\\n\";\n    my $l_fh = new IO::File \"< $l_file_name\" or die \"Cannot open $l_file_name : $!\";\n    binmode($l_fh);\n    my @l_bufer = ();\n    my $i=0;\n    while (read($l_fh,$l_bufer[$i],320)) { $i++; }\n    close $l_fh;\n    return \\@l_bufer;\n}\n\n\n# данная функция отправляет команду в командный порт модема\n# и ждет ответа указанного в регулярном выражении\n# принимает 2 параметра:\n# 1-й - команда\n# 2-й - регулярное выражение описывающее варианты ожидаемых ответов (по умолчанию OK)\nsub at_send{\n    my $l_cmd = shift;\n    my $l_rx = shift || qr/(OK)/;\n    print $SENDPORT \"$l_cmd\\r\";\n    print \"SEND: [$l_cmd]\\n\" if $VERBOSE;\n    return at_rec($l_rx);\n}\n\n\n# данная функция ждет от модема ответа указанного в регулярном выражении \n# принимает 1 параметра - регулярное выражение описывающее варианты ожидаемых ответов (по умолчанию OK)\nsub at_rec{\n    my $l_rx = shift || qr/OK/;\n    my $recive='';\n    #print \"white: [$l_rx]\\n\";\n    until ( $recive=~$l_rx ) {\n       $recive=<$SENDPORT>;\n       $recive=~s/[\\n\\r]+//msg;\n       print \"RECIVE: [$recive]\\n\" if $VERBOSE && $recive;\n    }\n    $recive=~$l_rx;\n    print \"END RECIVE: [$recive] [$1] [$l_rx]\\n\" if $VERBOSE;\n    return $1;\n}\n\n\n# данная функция закрывает ранее открытые порты модема\nsub exit_call{\n    print \"ОПОВЕЩЕНИЕ ОКОНЧЕНО\\n\";\n    close $SENDPORT_WAV;\n    at_send('AT+CHUP');\n    close $SENDPORT;\n}\n\n",
+			"file": "voice_menu.pl",
+			"file_size": 15266,
+			"file_write_time": 130235207688010555,
+			"settings":
+			{
+				"buffer_size": 11894,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "menu.01.pl",
+			"settings":
+			{
+				"buffer_size": 3239,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"contents": "Совсем недавно я написал <a href=\"http://habrahabr.ru/post/192930/\">пост</a> в котором дал немного теории, и описал практическую реализацию скрипта производящего голосовой обзвон (оповещение) абонентов по списку через usb модем Hyawei e1550. В одном из комментариев был задан <a href=\"http://habrahabr.ru/post/192930/#comment_6701910\">вопрос</a> о том как получить во время голосового соединения данные о нажатии кнопок на телефоне абонента. Детальное изучение этого вопроса и привело к созданию этого поста.\n\nВ данной статье будет представлена реализация голосового меню, с функциями:\n	- записи голосового сообщения\n	- выполнения системных команд\nВсе это стало возможным благодаря реализации декодера DTMF сигналов основанного на алгоритме Гёрцеля. \nВ качестве бонуса - архив исходниками голосового меню.\n<habracut />\n\n<h5>Среда разработки</h5>\n\nоперационная система: Linux\nДистрибутив: openSUSE 12.3\nЯдро: 3.7.10-1.16-desktop #1 SMP PREEMPT Fri May 31 20:21:23 UTC 2013 (97c14ba) i686 i686 i386 GNU/Linux\nЯзык программирования: Perl\nusb модем: Huawei e1550\n\n<h5>Приступим</h5>\n\nРеализация содержит следующие файлы и папки:\n1. voice_menu.pl - основной скрипт с реализацией функций голосового меню\n2. dtmf_decoder.pm - модуль декодирования dtmf сигналов (нажатия кнопок телефона в режиме тонового набора)\n3. menu.01.pl - содержит описание голосового меню\n4. menu.01 - папка с аудио файлами для menu.01.pl\n5. messages - папка с записями голосовых сообщений\n\nvoice_menu.pl\n<source>\n#!/usr/bin/perl\n\nuse v5.16;              # использовать версию Perl не ниже указанной\nuse strict;             # включить дополнительные проверки\nuse warnings;           # и расширенную диагностику\nuse diagnostics;        # выводить подробную диагностику ошибок\nuse utf8;\nuse locale;\nno warnings 'utf8';\n\n# подключаем модуль Time::HiRes и импортируем\n# в текущее пространство имен функцию sleep\n# особенность данной функции - возможность указывать\n# задержку меньше секунды\nuse Time::HiRes qw(sleep usleep gettimeofday);\n\n# подключаем модуль dtmf_decoder\nuse dtmf_decoder;\n\n\n# Для информации:\n# Сообщения типа CEND выдаются модемом при завершении вызова\n# и содержат в себе информацию о вызове, о причине завершения вызова\n# и о состоянии устройства.\n# формат вывода ^CEND:call_index, duration, end_status, cc_cause\n# где:\n# call_index - уникальный идентификатор вызова\n# duration - длительность вызова в секундах\n# end_status - код статуса устройства после завершения вызова\n# cc_cause - код причины завершения вызова\n\n# при подключении модема к компьютеру с OS Linux\n# создаются 3 usb интерфейса для обмена данными с модемом\n# обычно это:\n# /dev/ttyUSB0 - командный интерфейс модема\n# /dev/ttyUSB1 - голосовой(при включенном голосовом режиме) интерфейс модема\n# /dev/ttyUSB2 - командный интерфейс модема. Отличается от /dev/ttyUSB0 тем\n# что с него можно читать не только ответы модема на команды, а также служебные\n# сообщения. Такие как данные о качестве сигнала, вывод ^CEND и прочее\n\n# указываем порт для отсылки модему звука\nmy $VOICE_PORT = \"/dev/ttyUSB4\";\n\n# указываем порт для подачи модему команд\nmy $COMMAND_PORT = \"/dev/ttyUSB5\";\n\n# устанавливаем в:\n# 0 - чтобы отключить вывод отладочной информации\n# 1 - чтобы включить вывод отладочной информации\nmy $VERBOSE = 0;\n\n# Открываем командный порт модема на чтение и запись\nopen my $SENDPORT, '+<', $COMMAND_PORT or die \"Can't open '$COMMAND_PORT': $!\\n\";\n\n# Открываем голосовой  порт модема на чтение и запись\n# чтение аудио потока из порта в данной программе не используется\n# но вам ничто не мешает превратить данный скрипт в автоответчик например\nopen my $SENDPORT_WAV, '+<', $VOICE_PORT or die \"Can't open '$VOICE_PORT': $!\\n\";\n\n\n# вызываем функцию ожидания вызовов, которой передаются 1 параметр:\n#  - имя файла с голосовым меню\nexpect_calls('menu.01.pl');\n\n# по окончании обзвона закрываем все открытые файлы/порты\nexit_call();\n\n\n\n# данная функция производит обзвон абонентов по списку\nsub expect_calls{\n    # получаем имя файла с голосовым меню\n    my $l_file = shift;\n\n    # загружаем голосовое меню (файл menu.01.pl)\n    my $menu = load_menu('menu.01.pl'); \n\n    # данная команда включает в модеме голосовой режим\n    # один раз включив его можно удалить/заремарить\n    # эту команду. Модем запомнит состояние.\n    #at_send('AT^CVOICE=0'); \n\n    # данная команда включает в модеме отображение номера звонящего\n    my $l_rec = at_send(\"AT+CLIP=1\",qr/^(OK|ERROR)/);\n\n\n    # цикл ожидания входящего звонка\n    while ( ) {\n        # при входящем звонке должно поступить сообщение RING\n        $l_rec = at_rec(qr/^(RING)/);\n        accept_call($menu);\n    }\n}\n\n\n# данная функция производит попытку вызова указного номера\n# и в случае успеха - транслирует голосовое сообщение\nsub accept_call{\n    my $menu = shift;\n\n    # в этом массиве хранится стtк перемещений по меню\n    my $position = [$menu];\n\n    # текущее меню\n    my $cmenu = $position->[0];\n\n    my %call_info = ();\n    # запоминаем время начала\n    $call_info{start_time} = time;\n    # ждем сообщения с номером телефона звонящего абонента #+CLIP: \"+79117654321\",145,,,,0\n    $call_info{phone} = at_rec(qr/^\\+CLIP\\: \\\"(\\+\\d+)/);\n    $call_info{phone} =~s/^\\+\\d//;\n    # генерим имя файла для записи\n    $call_info{record_fname} = \"phone_$call_info{phone}.time_$call_info{start_time}\";\n\n    # принимаем входящий вызов\n    my $l_rec = at_send(\"ATA\",qr/^(OK|ERROR)/);\n    return 0 if $l_rec eq \"ERROR\";\n\n    # ожидаем установления соединения\n    $l_rec = at_rec(qr/^\\^??(CONN\\:1|CEND\\:|ERROR)/);\n    return 0 if $l_rec ne \"CONN:1\";\n\n    # переключаем модем в режим приема/передачи голоса\n    # OK - переключение прошло успешно\n    # ERROR - переключение не произведено\n    # CEND:.... - абонент недоступен, занят или сбросил вызов\n    $l_rec = at_send('AT^DDSETEX=2',qr/(OK|ERROR|CEND\\:)/);\n    return 0 if $l_rec ne \"OK\";\n\n    # Если дошли до сюда - значит вызов установлен\n    # Звук модему и от него передается порциями по 320 байт каждые 0.02 секунды\n    print \"time: [$call_info{start_time}] \\tphone: [$call_info{phone}] \\t\".\"Вызов принят.\\n\";\n\n    my $checker = 0;\n\n    my $dtmf = 0;\n\n    # буфер для входящих аудиоданных данных\n    my $snd_in;\n    \n    # буфер для исходящих аудиоданных данных\n    my $snd_out = $cmenu->{info_voice};\n    my $snd_count = 0;\n    my $snd_max = scalar @{$snd_out};\n\n    # открываем файл для записи входящего аудиопотока\n    my $l_fh = new IO::File \"> ./messages/$call_info{record_fname}.raw\" or die \"Cannot open $call_info{record_fname}.raw : $!\";\n    binmode($l_fh);\n\n    # Устанавливаем служебную переменную $| в единицу это отключает буферизацию.\n    # Таким образом данные в звуковой порт будут отправляться незамедлительно.\n    $|=1;\n\n    # проигрываем приветствие\n    #play_voice($snd_out);\n\n    # запоминаем время для отсчета 0.02 секунд\n    my $before = gettimeofday;\n\n    # основной цикл голосового меню\n    while (){\n        if ($snd_count == $snd_max) {\n            if ($cmenu->{record}==1){\n                    $snd_out = $menu->{standart_messages}{null}{title_voice};\n                    $snd_max = scalar @{$snd_out};\n                    $cmenu->{record}=2;\n                    print \"time: [$call_info{start_time}] \\tphone: [$call_info{phone}] \\tПроизводится запись голосового сообщения в [./messages/$call_info{record_fname}.raw].\\n\";\n            }\n\n            $snd_count = 0;\n        }\n\n        syswrite  $SENDPORT_WAV, $snd_out->[$snd_count] , 320;\n\n        sysread $SENDPORT_WAV, $snd_in, 320;\n        syswrite  $l_fh, $snd_in, 320 if $cmenu->{record} && $cmenu->{record} == 2;\n\n        $dtmf = dtmf_sample($snd_in);\n\n        if ($dtmf) {\n            #print \"time: [$call_info{start_time}] \\tphone: [$call_info{phoe}] \\tНажата кнопка [$dtmf].\\n\";\n            if ($dtmf eq '#') {\n                print \"time: [$call_info{start_time}] \\tphone: [$call_info{phone}] \\tВыбран возврат в главное меню.\\n\";\n                $position = [$menu];\n                $cmenu = $position->[0];\n                $snd_out = $menu->{info_voice};\n                $snd_count = 0;\n                $snd_max = scalar @{$snd_out};\n            } elsif ($dtmf eq '*') {\n                if ((scalar @{$position}) > 1) {\n                    print \"time: [$call_info{start_time}] \\tphone: [$call_info{phone}] \\tВыбран возврат в предыдущее меню.\\n\";\n                    shift @{$position};\n                    $cmenu = $position->[0];\n                    $snd_out = $cmenu->{info_voice};\n                    $snd_count = 0;\n                    $snd_max = scalar @{$snd_out};\n                }\n            } elsif ($cmenu->{menu}) {\n                if ($cmenu->{menu}{$dtmf}) {\n                    $cmenu = $cmenu->{menu}{$dtmf};\n                    print \"time: [$call_info{start_time}] \\tphone: [$call_info{phone}] \\tВыбран пункт меню [$cmenu->{title}].\\n\";\n                    unshift @{$position}, $cmenu;\n                    $snd_out = $cmenu->{info_voice};\n                    $snd_count = 0;\n                    $snd_max = scalar @{$snd_out};\n                    if ($cmenu->{command}) {\n                        print \"time: [$call_info{start_time}] \\tphone: [$call_info{phone}] \\tВыполнена команда [$cmenu->{command}].\\n\";\n                        system \"$cmenu->{command} &\";\n                    }\n                } \n            }\n        }\n\n        # мониторим состояние звонка\n        if ($checker==10) {\n            $l_rec = at_send(\"AT+CLCC\",qr/^\\^??(OK|ERROR|CEND)/);\n            # выходим если сброшен\n            if ($l_rec eq \"CEND\") {\n                print \"time: [$call_info{start_time}] \\tphone: [$call_info{phone}] \\tВызов завершен.\\n\";\n                return 0\n            }\n            $checker=0;\n        }\n\n        # ряд управляющих циклом переменных\n        $dtmf=0;\n        $checker++;\n        $snd_count++;\n\n        # ожидаем остаток времени\n        while( gettimeofday-$before < 0.02 ) { }\n        $before = gettimeofday;\n    }\n\n    # Вешаем трубку.\n    at_send('AT+CHUP');\n\n    # закрываем файл с полученным сообщением\n    close $l_fh;\n}\n\nsub play_voice{\n    my $voice = shift;\n    my $count = shift || 1;\n    while ($count) {\n        for my $sampe (@{$voice}){\n            syswrite  $SENDPORT_WAV, $sampe, 320;\n            #sleep(0.02);\n            my $before = gettimeofday;\n            while( gettimeofday-$before < 0.02 ) { }\n        }\n        $count--;\n    }\n}\n\n# данная функция загружает голосовое меню\nsub load_menu{\n    my $l_file_name = shift;\n    my %voice_menu = do $l_file_name;\n    $voice_menu{standart_messages}{null}{title_voice} = load_voice($voice_menu{standart_messages}{null}{title_voice_fname});\n    $voice_menu{standart_messages}{back}{title_voice} = load_voice($voice_menu{standart_messages}{back}{title_voice_fname});\n    $voice_menu{standart_messages}{back_to_main}{title_voice} = load_voice($voice_menu{title_voice_fname});\n    load_menu_voices(\\%voice_menu,$voice_menu{standart_messages});\n    return \\%voice_menu;\n}\n\n# данная функция загружает аудиофайлы голосового меню\nsub load_menu_voices{\n    my $menu = shift;\n    my $standart_messages = shift;\n    $menu->{info_voice} = load_voice($menu->{info_voice_fname});\n    for my $key (sort {$a <=> $b} keys %{$menu->{menu}}){\n        my $cur = $menu->{menu}{$key};\n        my $sub_voice = load_menu_voices($cur,$standart_messages);\n        $menu->{info_voice} = [@{$menu->{info_voice}},@{$sub_voice}];\n    }\n    $menu->{info_voice} = [ @{$menu->{info_voice}},\n                            @{$standart_messages->{back}{title_voice}},\n                            @{$standart_messages->{back_to_main}{title_voice}},\n                            @{$standart_messages->{null}{title_voice}},\n                            @{$standart_messages->{null}{title_voice}}\n                          ];\n    return load_voice($menu->{title_voice_fname});\n}\n\n# данная функция загружает голосовое сообщение в массив кусками по 320 байт\n# принимает 1 параметр - имя файла\n# формат звуковых данных - pcm, моно, 8000 кГц, 16 бит, signed\nsub load_voice{\n    my $l_file_name = shift;\n    print \"FILENAME: [$l_file_name]\\n\";\n    my $l_fh = new IO::File \"< $l_file_name\" or die \"Cannot open $l_file_name : $!\";\n    binmode($l_fh);\n    my @l_bufer = ();\n    my $i=0;\n    while (read($l_fh,$l_bufer[$i],320)) { $i++; }\n    close $l_fh;\n    return \\@l_bufer;\n}\n\n\n# данная функция отправляет команду в командный порт модема\n# и ждет ответа указанного в регулярном выражении\n# принимает 2 параметра:\n# 1-й - команда\n# 2-й - регулярное выражение описывающее варианты ожидаемых ответов (по умолчанию OK)\nsub at_send{\n    my $l_cmd = shift;\n    my $l_rx = shift || qr/(OK)/;\n    print $SENDPORT \"$l_cmd\\r\";\n    print \"SEND: [$l_cmd]\\n\" if $VERBOSE;\n    return at_rec($l_rx);\n}\n\n\n# данная функция ждет от модема ответа указанного в регулярном выражении \n# принимает 1 параметра - регулярное выражение описывающее варианты ожидаемых ответов (по умолчанию OK)\nsub at_rec{\n    my $l_rx = shift || qr/OK/;\n    my $recive='';\n    #print \"white: [$l_rx]\\n\";\n    until ( $recive=~$l_rx ) {\n	   $recive=<$SENDPORT>;\n	   $recive=~s/[\\n\\r]+//msg;\n	   print \"RECIVE: [$recive]\\n\" if $VERBOSE && $recive;\n    }\n    $recive=~$l_rx;\n    print \"END RECIVE: [$recive] [$1] [$l_rx]\\n\" if $VERBOSE;\n    return $1;\n}\n\n\n# данная функция закрывает ранее открытые порты модема\nsub exit_call{\n    print \"ОПОВЕЩЕНИЕ ОКОНЧЕНО\\n\";\n    close $SENDPORT_WAV;\n    at_send('AT+CHUP');\n    close $SENDPORT;\n}\n</source>\n\ndtmf_decoder.pm\n<source>\n# модуль: dtmf_detect\n# автор:  lastuniverse\n# за основу взят Си код Mr. Blue:\n#   http://www.phrack.org/issues.html?issue=50&id=13\n# данный модуль содержит реализацию алгоритма Гёрцеля \n#   http://ru.wikipedia.org/wiki/%D0%90%D0%BB%D0%B3%D0%BE%D1%80%D0%B8%D1%82%D0%BC_%D0%93%D1%91%D1%80%D1%86%D0%B5%D0%BB%D1%8F\n#   http://www.dsplib.ru/content/goertzel/goertzel.html\n\nuse v5.16;              # использовать версию Perl не ниже указанной\nuse strict;             # включить дополнительные проверки\nuse warnings;           # и расширенную диагностику\nuse diagnostics;        # выводить подробную диагностику ошибок\nuse utf8;\nuse locale;\n\npackage dtmf_decoder;   # указываем новое пространство имен\n\nrequire Exporter;               # загрузить стандартный модуль Exporter\nour @ISA = qw(Exporter);        # неизвестные имена искать в нем\n\n\nour @EXPORT = qw(dtmf_sample dtmf_clear);   # имена, экспортируемые по умолчанию\nour @EXPORT_OK = qw(_recalc );              # имена, экспортируемые по запросу\n\n# в этом хэш массиве будем хранить все наши настройки и данные\nmy %o = (\n  # хэш массив в котором будут храниться рассчитанные коэффициенты\n  # необходимые для работы алгоритма Гёрцеля\n  f => {\n    '697' => { K => 0, C => 0 },\n    '770' => { K => 0, C => 0 },\n    '852' => { K => 0, C => 0 },\n    '941' => { K => 0, C => 0 },\n    '1209' => { K => 0, C => 0 },\n    '1336' => { K => 0, C => 0 },\n    '1477' => { K => 0, C => 0 },\n    '1633' => { K => 0, C => 0 },\n  },\n  # список частот строк и столбцов таблицы dtmf сигналов\n  #          1209 Гц   1336 Гц   1477 Гц   1633 Гц\n  # 697 Гц   1         2         3         A \n  # 770 Гц   4         5         6         B\n  # 852 Гц   7         8         9         C\n  # 941 Гц   *         0         #         D   \n  rf => [ '697', '770', '852', '941' ],\n  cf => [ '1209', '1336', '1477', '1633' ],\n  # Вспомогательный хэш массив для определения номера dtmf сигнала\n  dtmf => {\n    '697' => { '1209' => 1, '1336' => 2, '1477' => 3, '1633' => 4 },\n    '770' => { '1209' => 5, '1336' => 6, '1477' => 7, '1633' => 8  },\n    '852' => { '1209' => 9, '1336' => 10, '1477' => 11, '1633' => 12  },\n    '941' => { '1209' => 13, '1336' => 14, '1477' => 15, '1633' => 16  },\n  },\n  # Список наименований dtmf сигналов (входным параметром является \n  # значение из вспомогательного массива dtmf)\n  # выходным - наименование нажатой кгнопки\n  info => ['NONE', '1', '2', '3', 'A', '4', '5', '6', 'B', '7', '8', '9', 'C', '*', '0', '#', 'D'],\n  # далее идут параметры используемые для работы алгоритма\n  tones => 0,   # рассчитывается. содержит количество обрабатываемых частот\n  rate => 8000, # частота оцифровки обрабатываемого сигнала\n  len => 100,   # количество оцифровок обрабатываемых за раз\n                # значение выбрано из расчета обработать за раз пакет из 320 байт\n                # считанных из аудио порта модема (2 байта на 1 оцифровку) \n                # (уменьшил до 100 для увеличения скорости обработки)\n  range => 0.15,      # используется для приведения значений максимальной мощности\n  thresh => 99999999, # используется для отсекания сигналов с мощностью меньше указанной\n  mincount => 4,      # минимальное количество пакетов в которых фиксируется нажатие кнопки\n                      # для того чтобы алгоритм считал кнопку нажатой\n                      # range, thresh и mincount подбирались опытным путем и тестировались\n                      # нескольких десятков звуковых файлов содержащих dtmf сигналы и посторонние\n                      # шумовые эффекты.\n\n  debug => 0,     # включает вывод отладочной информации \n\n  # хэш массив содержащий временные данные работы алгоритма\n  t => {\n    mincount => 0,\n    sample => [],\n    power =>  {},\n    maxpower => 0,\n    thresh => 0,\n    on    =>  {},\n    last_dtmf => ''\n  }\n);\n\n# данная функция производит предварительный расчет коэффициентов необходимых для работы алгоритма\nsub _recalc {\n  $o{tones} = scalar keys %{$o{f}};\n  for my $f (sort { $a <=> $b } keys %{$o{f}}) {\n    $o{f}{$f}{K} = $o{len} * $f / $o{rate};\n    $o{f}{$f}{C} = 2.0 * cos( 2.0 * 3.14159265 * $o{f}{$f}{K} / $o{len} );\n    print \"COEFF: [$f] \\t[$o{f}{$f}{K}] \\t[$o{f}{$f}{C}]\\n\" if $o{debug};\n  }\n}\n\n# данная функция производит предварительный расчет мощностей гармоник (указанных частот)\nsub _calc_power {\n  my $freq_list = shift;\n  my @fk = @{$freq_list};\n  my %ff = %{$o{f}};\n  my %fp = %{$o{t}{power}};\n\n  my %u0 = ();\n  my %u1 = ();\n  my $t  = 0.0;\n  my $in = 0.0;\n  my $i  = 0;\n\n  for my $f (@fk) {\n    $u0{$f} = 0.0;\n    $u1{$f} = 0.0;\n  }\n\n  while ($i<$o{len}) {   # feedback\n    $in = $o{t}{sample}[$i] || 0; # >> 7;\n    for my $f (@fk) {\n      $t = $u0{$f};\n      $u0{$f} = $in + $ff{$f}{C} * $u0{$f} - $u1{$f};\n      $u1{$f} = $t;\n    }\n    $i++;\n  }\n\n  print \"MAXPOWER: [\" if $o{debug} > 1;\n  for my $f (@fk) {\n    $o{t}{power}{$f} = $u0{$f} * $u0{$f} + $u1{$f} * $u1{$f} - $ff{$f}{C} * $u0{$f} * $u1{$f}; \n    $o{t}{maxpower} = $o{t}{power}{$f} if $o{t}{power}{$f} > $o{t}{maxpower};\n    print \"$o{t}{maxpower}, \" if $o{debug} > 1;\n  }\n  print \"]\\n\" if $o{debug} > 1;\n}\n\n# данная функция отсекает пакеты с мощьностью сигнала ниже $o{t}{maxpower}\n# расчитывает проходной уровень мощности для частот\n# и фиксирует частоты уровень мощности которых выше проходного в массиве $o{t}{on}{$f}\nsub _midle_calc {\n  my $freq_list = shift;\n  my @fl = @{$freq_list};\n  _calc_power($freq_list);\n\n  return 0 if $o{t}{maxpower} < $o{thresh};\n  $o{t}{thresh} = $o{range}  * $o{t}{maxpower};\n  \n  my $on_count = 0;\n  for my $f (@fl) {\n    if ($o{t}{power}{$f} > $o{t}{thresh}) {\n      $o{t}{on}{$f} = 1;\n      $on_count++;\n    } else {\n      $o{t}{on}{$f} = 0;\n    }\n    \n  }\n  return $on_count;\n}\n\n# данная функция производит проверку наличия 2-х частот в обработанном пакете\n# 1-й частоты из группы частот означающих номер строки из таблицы dtmf\n# и 1-й частоты из группы частот означающих номер колонки из таблицы dtmf\n# если проверка пройдена - возвращает значение из массива dtmf (номер)\nsub _decode {\n  my $row_count = _midle_calc($o{rf});\n  return 0 unless $row_count;\n\n  my $col_count += _midle_calc($o{cf});\n  return 0 unless $col_count;\n  return 0 unless $row_count == 1 && $col_count == 1;\n  for my $dtmf (@{$o{rf}}) {\n    if ($o{t}{on}{$dtmf}) {\n      for my $f (@{$o{cf}}) {\n        return $o{dtmf}{$dtmf}{$f} if $o{t}{on}{$f};\n      }\n    }\n  }\n  #return 0 if $on_count == 0;\n  return 0; \n}\n\n# данная функция производит финальную проверку наличия dtmf сигнала\n# основываясь на его длительности (mincount) отсекая случайные срабатывания\n# и возвращает название нажатой кнопки из массива info\nsub _analise {\n  my $x = _decode();\n  _sample_clear();\n  #return $x;\n\n  if ($x && $x == $o{t}{last_dtmf}){\n    $o{t}{mincount}++;\n  } else {\n    if ( $o{t}{last_dtmf} && $x != $o{t}{last_dtmf} ) {\n      if ($o{t}{mincount} >= $o{mincount}){\n        my $r = $o{t}{last_dtmf};\n        $o{t}{last_dtmf} = $x;\n        return $r;\n      }\n    }\n    $o{t}{mincount} = 0;\n  }\n  \n  $o{t}{last_dtmf} = $x;\n  return 0;\n}\n\n# служебная функция для отчистки результатов промежуточных расчетов\n# вызывается после расчетов мощьностей для каждого пакета\nsub _sample_clear {\n  $o{t}{sample} = [];\n  $o{t}{power} = {};\n  $o{t}{maxpower} = 0;\n  $o{t}{on} = {};\n  $o{t}{thresh} = 0;\n}\n\n# функция для отчистки результатов промежуточных расчетов\n# вызывается по завершении голосового вызова\nsub dtmf_clear {\n  _sample_clear();\n  $o{t}{mincount} = 0;\n  $o{t}{last_dtmf} = {};\n}\n\n# функция принимающая на обработку пакет аудиоданных\n# и возвращающая название нажатой кнопки в случае\n# обнаружения dtmf сигнала\nsub dtmf_sample {\n  my $_ = shift;\n  my @a = unpack(\"s$o{len}\");\n  $o{t}{sample} = \\@a;\n  my $x = _analise(); \n  print \"DTMF: [\".$o{info}[$x].\"]\\n\" if $x; #&& $o{debug};\n  return $o{info}[$x] if $x;\n\n}\n\n# производим расчет коэффициентов по умолчанию при подключении модуля\n_recalc();\n\n1;\n</source>\n\nmenu.01.pl\n<source>\nuse utf8;\nuse locale;\n(\n	standart_messages => {\n		back => {\n			title => \"возврат в предыдущее меню\", # заноситься в лог\n			title_voice_fname	=> \"./menu.01/back.raw\" # озвучка при выборе меню (для возврата в предыдущее меню нажмите *)\n		},\n		null => {\n			title_voice_fname	=> \"./menu.01/null.raw\" # озвучка при выборе меню (для возврата в предыдущее меню нажмите *)\n		}\n	},\n	title => \"главное меню\", # заноситься в лог\n	info_voice_fname	=> \"./menu.01/main.menu.info.raw\",	# озвучка при входе в меню	(вы находитесь в главном меню компании бла-бла-бла)\n	title_voice_fname	=> \"./menu.01/main.menu.title.raw\",       # озвучка при выборе меню (для возврата в главное меню нажмите #)\n	menu => {\n		'1' => {\n			title => \"о нас\", # заноситься в лог\n			info_voice_fname	=> \"./menu.01/sub.menu.1.info.raw\",	# озвучка при входе в меню	(наша компания занимается предоставлением услуг в сфере бла-бла-бла)\n			title_voice_fname	=> \"./menu.01/sub.menu.1.title.raw\"       # озвучка при выборе меню (если вы хотите узнать больше о нашей компании нажмите 1)\n		},\n		'2' => {\n			title => \"наши услуги\", # заноситься в лог\n			info_voice_fname	=> \"./menu.01/sub.menu.2.info.raw\",	# озвучка при входе в меню	(вы находитесь в меню - наши услуги)\n			title_voice_fname	=> \"./menu.01/sub.menu.2.title.raw\",      # озвучка при выборе меню (если вы хотите ознакомиться с предоставляемыми нами услугами нажмите 2)\n			menu => {\n				'1'	=> {\n					title => \"набить морду соседу\", # заноситься в лог\n					info_voice_fname	=> \"./menu.01/sub.menu.2.1.info.raw\",	# озвучка при входе в меню	(стоимость услуги \"набить морду соседу\" составляет бла-бла-бла)\n					title_voice_fname	=> \"./menu.01/sub.menu.2.1.title.raw\"    # озвучка при выборе меню (если вы хотите ознакомиться с условиями предоставления услуги \"набить морду соседу\" нажмите 1)\n				},\n				'2'	=> {\n					title => \"спровадить тещу\", # заноситься в лог\n					info_voice_fname	=> \"./menu.01/sub.menu.2.2.info.raw\",	# озвучка при входе в меню	(стоимость услуги \"спровадить тещу\" составляет бла-бла-бла)\n					title_voice_fname	=> \"./menu.01/sub.menu.2.2.title.raw\"    # озвучка при выборе меню (если вы хотите ознакомиться с условиями предоставления услуги \"спровадить тещу\" нажмите 2)\n				},\n\n			}			\n		},\n		'9' => {\n			title => \"послушать анекдот\", # заноситься в лог\n			info_voice_fname	=> \"./menu.01/sub.menu.9.info.raw\",	# озвучка при входе в меню	(анекдот)\n			title_voice_fname	=> \"./menu.01/sub.menu.9.title.raw\"       # озвучка при выборе меню (если вы хотите послушать анекдот нажмите 9)\n		},\n		'8' => {\n			title => \"удалить голосовое меню\", # заноситься в лог\n			info_voice_fname	=> \"./menu.01/sub.menu.8.info.raw\",	# озвучка при входе в меню	(голосовое меню удалено)\n			title_voice_fname	=> \"./menu.01/sub.menu.8.title.raw\",      # озвучка при выборе меню (если вы хотите удалить программу \"голосовое меню\" нажмите 8)\n			command	=> 'echo \"Не стоит так делать -> rm -R *\"'\n		},\n		'7' => {\n			title => \"оставить голосовое сообщение\", # заноситься в лог\n			info_voice_fname	=> \"./menu.01/sub.menu.7.info.raw\",	# озвучка при входе в меню	(вы можете оставить ваше сообщение после гудка)\n			title_voice_fname	=> \"./menu.01/sub.menu.7.title.raw\",      # озвучка при выборе меню (если вы хотите оставить голосовое сообщение нажмите 7)\n			record	=> 1\n		}\n	}\n);\n</source>\n\n\n<h5>Обещанный бонус</h5>\n<a href=\"80.237.22.134/habr/huawei.voice.menu.rar\">архив с исходниками</a> на случай хабрапарсера\n\nЕсли найдете ошибки, пишите в личку, исправлю.",
+			"file": "habrahabr",
+			"file_size": 1453,
+			"file_write_time": 130235199959050491,
+			"settings":
+			{
+				"buffer_size": 24746,
+				"line_ending": "Unix",
+				"name": "Совсем недавно я написал <a href=\"http://habrahabr"
+			}
+		}
+	],
+	"build_system": "",
+	"command_palette":
+	{
+		"height": 392.0,
+		"selected_items":
+		[
+		],
+		"width": 392.0
+	},
+	"console":
+	{
+		"height": 114.0,
+		"history":
+		[
+			"print_a([1,2,3,4,5])",
+			"pwd"
+		]
+	},
+	"distraction_free":
+	{
+		"menu_visible": true,
+		"show_minimap": false,
+		"show_open_files": false,
+		"show_tabs": false,
+		"side_bar_visible": false,
+		"status_bar_visible": false
+	},
+	"file_history":
+	[
+		"/home/roman/bin/perl/huawei/huawei/huawey_voice_call_event.pl",
+		"/home/roman/bin/perl/huawui.e1550.voice.call/dtmf_decode.01.pl",
+		"/home/roman/bin/perl/huawui.e1550.voice.call/dtmf_decoder.pm",
+		"/home/roman/bin/perl/huawui.e1550.voice.call/dtmf_decode.02.pl",
+		"/home/roman/bin/perl/huawui.e1550.voice.call/list.01.pl",
+		"/home/roman/bin/perl/huawui.e1550.voice.call/Текстовый файл",
+		"/home/roman/public_html/newengine.local/backup/site/index.pl",
+		"/home/roman/.config/sublime-text-3/Packages/Default/Preferences.sublime-settings"
+	],
+	"find":
+	{
+		"height": 34.0
+	},
+	"find_in_files":
+	{
+		"height": 0.0,
+		"where_history":
+		[
+		]
+	},
+	"find_state":
+	{
+		"case_sensitive": true,
+		"find_history":
+		[
+			"title_voice",
+			"info_voice",
+			"_clear",
+			"last",
+			"lasl",
+			"$opt",
+			"N",
+			"FSAMPLE",
+			"$g_count",
+			"NUMTONES",
+			"MFmode",
+			"N",
+			"FSAMPLE",
+			"NUMTONES",
+			"FLUSH_TIME",
+			"RANGE",
+			"FLUSH_TIME",
+			"coef",
+			"DSIL",
+			"NUMTONES",
+			"\\n",
+			"coef",
+			"[",
+			"print",
+			"fd2",
+			"coef",
+			"k[",
+			"dtran",
+			"coef",
+			"$frame",
+			"argv[0]",
+			"N",
+			"MFmode",
+			"1",
+			"scroll",
+			"оффтоп"
+		],
+		"highlight": true,
+		"in_selection": false,
+		"preserve_case": false,
+		"regex": false,
+		"replace_history":
+		[
+			"title_voice_fname",
+			"info_voice_fname",
+			"$o",
+			"$NUM",
+			"$FSAMPLE",
+			"$NSAMPLE",
+			"$FSAMPLE",
+			"$g_i",
+			"$tones",
+			"$N",
+			"$FSAMPLE",
+			"$numtones",
+			"$coef->",
+			"$coef",
+			"$coef->",
+			"$dtran->",
+			"$dtran"
+		],
+		"reverse": false,
+		"show_context": true,
+		"use_buffer2": true,
+		"whole_word": false,
+		"wrap": true
+	},
+	"groups":
+	[
+		{
+			"selected": 3,
+			"sheets":
+			[
+				{
+					"buffer": 0,
+					"file": "dtmf_decoder.pm",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 7849,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								7849,
+								7849
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/Perl/Perl.tmLanguage",
+							"tab_size": 2,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"type": "text"
+				},
+				{
+					"buffer": 1,
+					"file": "voice_menu.pl",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 11894,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								11894,
+								11894
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/Perl/Perl.tmLanguage",
+							"tab_size": 4,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 3814.0,
+						"zoom_level": 1.0
+					},
+					"type": "text"
+				},
+				{
+					"buffer": 2,
+					"file": "menu.01.pl",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 3239,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								3239,
+								3239
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/Perl/Perl.tmLanguage"
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"type": "text"
+				},
+				{
+					"buffer": 3,
+					"file": "habrahabr",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 24746,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								24746,
+								24746
+							]
+						],
+						"settings":
+						{
+							"auto_name": "Совсем недавно я написал <a href=\"http://habrahabr",
+							"syntax": "Packages/Text/Plain text.tmLanguage"
+						},
+						"translation.x": 0.0,
+						"translation.y": 8416.0,
+						"zoom_level": 1.0
+					},
+					"type": "text"
+				}
+			]
+		}
+	],
+	"incremental_find":
+	{
+		"height": 21.0
+	},
+	"input":
+	{
+		"height": 0.0
+	},
+	"layout":
+	{
+		"cells":
+		[
+			[
+				0,
+				0,
+				1,
+				1
+			]
+		],
+		"cols":
+		[
+			0.0,
+			1.0
+		],
+		"rows":
+		[
+			0.0,
+			1.0
+		]
+	},
+	"menu_visible": true,
+	"project": "untitled.sublime-project",
+	"replace":
+	{
+		"height": 62.0
+	},
+	"save_all_on_build": true,
+	"select_file":
+	{
+		"height": 0.0,
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"select_project":
+	{
+		"height": 0.0,
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"select_symbol":
+	{
+		"height": 0.0,
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"settings":
+	{
+	},
+	"show_minimap": true,
+	"show_open_files": false,
+	"show_tabs": true,
+	"side_bar_visible": true,
+	"side_bar_width": 207.0,
+	"status_bar_visible": true,
+	"template_settings":
+	{
+	}
+}

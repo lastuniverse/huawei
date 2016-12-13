@@ -1,0 +1,14 @@
+# Logs
+logs
+*.log
+
+
+# git auto push
+git.push.sh
+
+# Runtime data
+pids
+*.pid
+*.seed
+
+
